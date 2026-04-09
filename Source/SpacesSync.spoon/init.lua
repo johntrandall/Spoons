@@ -27,19 +27,9 @@ obj.author = "John Randall <john@johnrandall.com>"
 obj.homepage = "https://github.com/johntrandall/hammerspoon-spaces-sync"
 obj.license = "MIT - https://opensource.org/licenses/MIT"
 
--- Preload extensions to avoid lazy-load latency during sync.
--- require() alone returns Hammerspoon's lazy proxy without loading the
--- Objective-C bridge. Touching one function on each module forces the
--- actual load so it doesn't happen mid-sync.
-require("hs.screen");      local _ = hs.screen.allScreens
-require("hs.spaces");      _ = hs.spaces.activeSpaces
-require("hs.application"); _ = hs.application.frontmostApplication
-require("hs.timer");       _ = hs.timer.secondsSinceEpoch
-
 --- SpacesSync.logger
 --- Variable
---- Logger object used within the Spoon. Can be accessed to set the default
---- log level for the messages coming from the Spoon.
+--- Logger object used within the Spoon. Set the log level to control verbosity.
 ---
 --- Default log level: `info`. Set to `debug` for verbose watcher state dumps
 --- and per-target dispatch details. Set to `warning` to suppress routine sync
@@ -197,11 +187,11 @@ end
 -- SYNC GROUP LOOKUP
 -- ============================================================================
 
-local function getTargetsFor(self, triggerUUID)
+local function getTargetsFor(triggerUUID)
   local pos = uuidToPosition[triggerUUID]
   if not pos then return nil end
 
-  for _, group in ipairs(self.syncGroups) do
+  for _, group in ipairs(obj.syncGroups) do
     local inGroup = false
     for _, gpos in ipairs(group) do
       if gpos == pos then inGroup = true; break end
@@ -258,7 +248,7 @@ end
 -- SYNC ENGINE
 -- ============================================================================
 
-local function syncTarget(self, triggerUUID, triggerSpaceID, targetUUID)
+local function syncTarget(triggerUUID, triggerSpaceID, targetUUID)
   local label = getDisplayLabel(targetUUID)
   local targetCount = getSpaceCount(targetUUID)
 
@@ -309,7 +299,7 @@ end
 -- WATCHER
 -- ============================================================================
 
-local function setupWatcher(self)
+local function setupWatcher()
   if state.spaceWatcher then
     state.spaceWatcher:stop()
   end
@@ -325,7 +315,7 @@ local function setupWatcher(self)
 
     local currentSpaces = hs.spaces.activeSpaces() or {}
 
-    do
+    if obj.logger.level >= 4 then -- debug level
       local parts = {}
       for uuid, spaceID in pairs(currentSpaces) do
         local idx = getSpaceIndex(uuid, spaceID) or "?"
@@ -360,7 +350,7 @@ local function setupWatcher(self)
     end
 
     -- Find targets for the triggering monitor
-    local targets = getTargetsFor(self, changedUUID)
+    local targets = getTargetsFor(changedUUID)
     if not targets or #targets == 0 then
       obj.logger.d("SKIP: " .. getDisplayLabel(changedUUID) .. " not in any sync group")
       state.lastActiveSpaces = currentSpaces
@@ -368,8 +358,8 @@ local function setupWatcher(self)
     end
 
     local targetNames = {}
-    for _, uuid in ipairs(targets) do
-      table.insert(targetNames, getDisplayLabel(uuid))
+    for _, targetUUID in ipairs(targets) do
+      table.insert(targetNames, getDisplayLabel(targetUUID))
     end
     obj.logger.i("SYNC: " .. getDisplayLabel(changedUUID) .. " (trigger) -> index " .. tostring(newIndex) .. " | targets: " .. table.concat(targetNames, ", "))
 
@@ -379,7 +369,7 @@ local function setupWatcher(self)
       if i > #targets then
         state.lastActiveSpaces = hs.spaces.activeSpaces() or {}
 
-        do
+        if obj.logger.level >= 4 then -- debug level
           local parts = {}
           for uuid, spaceID in pairs(state.lastActiveSpaces) do
             local idx = getSpaceIndex(uuid, spaceID) or "?"
@@ -389,7 +379,7 @@ local function setupWatcher(self)
         end
 
         if state.debounceTimer then state.debounceTimer:stop() end
-        state.debounceTimer = hs.timer.doAfter(self.debounceSeconds, function()
+        state.debounceTimer = hs.timer.doAfter(obj.debounceSeconds, function()
           state.syncInProgress = false
           state.lastActiveSpaces = hs.spaces.activeSpaces() or {}
           obj.logger.d("Watcher re-enabled")
@@ -397,8 +387,8 @@ local function setupWatcher(self)
         return
       end
 
-      syncTarget(self, changedUUID, changedSpaceID, targets[i])
-      state.pendingSyncTimer = hs.timer.doAfter(self.switchDelay, function()
+      syncTarget(changedUUID, changedSpaceID, targets[i])
+      state.pendingSyncTimer = hs.timer.doAfter(obj.switchDelay, function()
         state.pendingSyncTimer = nil
         syncNext(i + 1)
       end)
@@ -427,14 +417,14 @@ local function checkEnvironment()
   state.osBlocked = false
 
   -- Check macOS version
-  local os = getOSVersion()
-  if os.major < MIN_OS_MAJOR then
-    obj.logger.e("macOS " .. MIN_OS_MAJOR .. "+ required (you have " .. os.str .. "). Space sync will not activate.")
+  local osVer = getOSVersion()
+  if osVer.major < MIN_OS_MAJOR then
+    obj.logger.e("macOS " .. MIN_OS_MAJOR .. "+ required (you have " .. osVer.str .. "). Space sync will not activate.")
     state.osBlocked = true
   else
     local testedStr = TESTED_OS.major .. "." .. TESTED_OS.minor .. "." .. TESTED_OS.patch
-    if os.major ~= TESTED_OS.major or os.minor ~= TESTED_OS.minor or os.patch ~= TESTED_OS.patch then
-      obj.logger.w("Tested on macOS " .. testedStr .. ", you have " .. os.str .. ". hs.spaces uses private APIs — behavior may differ.")
+    if osVer.major ~= TESTED_OS.major or osVer.minor ~= TESTED_OS.minor or osVer.patch ~= TESTED_OS.patch then
+      obj.logger.w("Tested on macOS " .. testedStr .. ", you have " .. osVer.str .. ". hs.spaces uses private APIs — behavior may differ.")
     end
   end
 
@@ -487,7 +477,69 @@ end
 --- Returns:
 ---  * The SpacesSync object
 function obj:start()
-  obj.logger.i("Starting (SpacesSync " .. self.version .. ")")
+  -- Clean up any in-flight state from a previous start()
+  if state.enabled then
+    self:stop()
+  end
+
+  -- Preload extensions to avoid lazy-load latency during sync.
+  -- require() alone returns Hammerspoon's lazy proxy without loading the
+  -- Objective-C bridge. Touching one function on each module forces the
+  -- actual load so it doesn't happen mid-sync.
+  require("hs.screen");      local _ = hs.screen.allScreens
+  require("hs.spaces");      _ = hs.spaces.activeSpaces
+  -- hs.application is loaded as a transitive dependency of hs.spaces.gotoSpace()
+  require("hs.application"); _ = hs.application.frontmostApplication
+  require("hs.timer");       _ = hs.timer.secondsSinceEpoch
+
+  obj.logger.i("Starting (SpacesSync " .. obj.version .. ")")
+
+  -- Validate configuration
+  if type(obj.syncGroups) ~= "table" then
+    obj.logger.e("syncGroups must be a table, got " .. type(obj.syncGroups))
+    return self
+  end
+  for gi, group in ipairs(obj.syncGroups) do
+    if type(group) ~= "table" then
+      obj.logger.e("syncGroups[" .. gi .. "] must be a table, got " .. type(group))
+      return self
+    end
+    if #group < 2 then
+      obj.logger.w("syncGroups[" .. gi .. "] has " .. #group .. " member(s) — need at least 2 to sync")
+    end
+    -- Check for overlapping groups
+    for _, pos in ipairs(group) do
+      if type(pos) ~= "number" or pos < 1 or pos ~= math.floor(pos) then
+        obj.logger.e("syncGroups[" .. gi .. "] contains invalid position: " .. tostring(pos) .. " (must be a positive integer)")
+        return self
+      end
+    end
+  end
+  -- Detect overlapping groups (same position in multiple groups)
+  local positionSeen = {}
+  for gi, group in ipairs(obj.syncGroups) do
+    for _, pos in ipairs(group) do
+      if positionSeen[pos] then
+        obj.logger.w("Position " .. pos .. " appears in group " .. positionSeen[pos] .. " and group " .. gi .. " — only the first group will be used for triggers from this monitor")
+      else
+        positionSeen[pos] = gi
+      end
+    end
+  end
+  if type(obj.switchDelay) ~= "number" or obj.switchDelay < 0 then
+    obj.logger.e("switchDelay must be a non-negative number, got " .. tostring(obj.switchDelay))
+    return self
+  end
+  if obj.switchDelay < 0.1 then
+    obj.logger.w("switchDelay=" .. obj.switchDelay .. "s — macOS may drop rapid gotoSpace() calls (0.3s recommended)")
+  end
+  if type(obj.debounceSeconds) ~= "number" or obj.debounceSeconds < 0 then
+    obj.logger.e("debounceSeconds must be a non-negative number, got " .. tostring(obj.debounceSeconds))
+    return self
+  end
+  if obj.debounceSeconds < 0.3 then
+    obj.logger.w("debounceSeconds=" .. obj.debounceSeconds .. "s — watcher may react to its own switches (0.8s recommended)")
+  end
 
   checkEnvironment()
 
@@ -504,19 +556,17 @@ function obj:start()
   for pos = 1, totalScreens do
     local uuid = positionToUUID[pos]
     if uuid then
-      local screen = hs.screen.find(uuid)
-      local f = screen:frame()
-      obj.logger.i("  pos " .. pos .. ": " .. screen:name() .. " (x=" .. f.x .. ", y=" .. f.y .. ")")
+      obj.logger.i("  pos " .. pos .. ": " .. getDisplayLabel(uuid))
     end
   end
 
   -- Log sync groups
-  for gi, group in ipairs(self.syncGroups) do
+  for gi, group in ipairs(obj.syncGroups) do
     local members = {}
     for _, pos in ipairs(group) do
       local uuid = positionToUUID[pos]
       if uuid then
-        table.insert(members, "pos " .. pos .. " (" .. hs.screen.find(uuid):name() .. ")")
+        table.insert(members, "pos " .. pos .. " (" .. getDisplayLabel(uuid) .. ")")
       else
         table.insert(members, "pos " .. pos .. " (not connected)")
       end
@@ -527,15 +577,15 @@ function obj:start()
   -- Log independent monitors
   for pos = 1, totalScreens do
     local uuid = positionToUUID[pos]
-    if uuid and not getTargetsFor(self, uuid) then
-      obj.logger.i("Independent: pos " .. pos .. " (" .. hs.screen.find(uuid):name() .. ")")
+    if uuid and not getTargetsFor(uuid) then
+      obj.logger.i("Independent: pos " .. pos .. " (" .. getDisplayLabel(uuid) .. ")")
     end
   end
 
   state.enabled = true
   state.syncInProgress = false
   state.lastActiveSpaces = hs.spaces.activeSpaces() or {}
-  setupWatcher(self)
+  setupWatcher()
   hs.alert.show("SpacesSync: ON")
   obj.logger.i("Enabled")
 
@@ -615,7 +665,7 @@ end
 ---    `spoon.SpacesSync:bindHotkeys(spoon.SpacesSync.defaultHotkeys)`
 function obj:bindHotkeys(mapping)
   local def = {
-    toggle = hs.fnutils.partial(self.toggle, self),
+    toggle = function() self:toggle() end,
   }
   hs.spoons.bindHotkeysToSpec(def, mapping)
   return self
